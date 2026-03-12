@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Model files (too large for git)
+*.onnx
+*.pth
+*.ckpt
+*.tflite
+*.task
+*.h5
+*.pkl
+*.bin
+*.pt
+*.zip
+
+# Dataset images
+face_retouch_ai/datasets/
+
+# Input/Output images
+**/inputs/
+**/outputs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Misc
+*.log
+*.bak
