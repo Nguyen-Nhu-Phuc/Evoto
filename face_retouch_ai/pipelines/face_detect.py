@@ -1,8 +1,10 @@
 """
-Step 1 — Face Detection using RetinaFace (serengil/retinaface).
-Auto-installs the package if missing.
-Returns face bounding boxes, confidence scores and landmarks.
-Uses mp.tasks.vision.FaceDetector API as fallback (mediapipe >= 0.10.14).
+Step 1 — Face Detection with robust fallback order.
+
+Priority:
+  1) InsightFace FaceAnalysis (recommended, no TensorFlow conflict)
+  2) serengil/retinaface (optional)
+  3) MediaPipe FaceDetector tasks API
 """
 
 import cv2
@@ -36,25 +38,51 @@ def detect_faces(img_rgb: np.ndarray):
     if img_rgb is None or img_rgb.size == 0:
         raise ValueError("Empty image")
 
-    print("[Step 1] Face Detection — RetinaFace")
+    print("[Step 1] Face Detection")
     faces = []
 
-    # --- Primary: serengil/retinaface ---
+    # --- Primary: InsightFace ---
     try:
-        from retinaface import RetinaFace as RF
+        from insightface.app import FaceAnalysis
 
-        resp = RF.detect_faces(img_rgb)
-        if isinstance(resp, dict) and len(resp) > 0:
-            for key, val in resp.items():
-                area = val.get("facial_area", [])
-                score = val.get("score", 0.0)
-                lms = val.get("landmarks", {})
-                faces.append({
-                    "bbox": list(area),
-                    "score": float(score),
-                    "landmarks": lms,
-                })
-            print(f"  RetinaFace (serengil) found {len(faces)} face(s).")
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        for det_sz in [(640, 640), (320, 320)]:
+            try:
+                app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+            except TypeError:
+                app = FaceAnalysis(name="buffalo_l")
+            app.prepare(ctx_id=0, det_size=det_sz)
+            dets = app.get(img_bgr)
+            if dets:
+                for d in dets:
+                    bbox = d.bbox.astype(int).tolist()
+                    faces.append({
+                        "bbox": bbox,
+                        "score": float(getattr(d, "det_score", 0.0)),
+                        "landmarks": {},
+                    })
+                print(f"  InsightFace found {len(faces)} face(s) at det_size={det_sz}.")
+                break
+    except Exception as exc:
+        print(f"  InsightFace failed: {exc}")
+
+    # --- Secondary: serengil/retinaface ---
+    try:
+        if not faces:
+            from retinaface import RetinaFace as RF
+
+            resp = RF.detect_faces(img_rgb)
+            if isinstance(resp, dict) and len(resp) > 0:
+                for _, val in resp.items():
+                    area = val.get("facial_area", [])
+                    score = val.get("score", 0.0)
+                    lms = val.get("landmarks", {})
+                    faces.append({
+                        "bbox": list(area),
+                        "score": float(score),
+                        "landmarks": lms,
+                    })
+                print(f"  RetinaFace (serengil) found {len(faces)} face(s).")
     except Exception as exc:
         print(f"  RetinaFace failed: {exc}")
 

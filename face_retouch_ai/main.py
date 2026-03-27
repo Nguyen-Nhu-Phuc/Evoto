@@ -1,16 +1,17 @@
 """
-AI Face Retouch Pipeline — main orchestrator.
+AI Face Retouch Pipeline — main orchestrator (Evoto-style).
 
 Runs all 9 steps in sequence:
   1. Face Detection    (RetinaFace)
   2. Face Landmarks    (MediaPipe FaceMesh 478)
   3. Face Parsing      (BiSeNet 19-class)
-  4. Blemish Detection (U-Net / heuristic)
-  5. Mask Expansion    (dilate + blur)
-  6. AI Inpainting     (LaMa / OpenCV)
-  7. Skin Smoothing    (guided-filter freq-sep)
-  8. Texture Restore   (clamped high-pass)
-  9. Strength Blend    (slider [0, 1])
+  4. Blemish Detection (multi-stage: redness + texture + blob)
+  5. Mask Expansion    (distance-transform, expand_px=12)
+  6. AI Inpainting     (LaMa with pre-dilated mask)
+  7. Skin Smoothing    (frequency-separation)
+  8. Texture Restore   (high-pass σ=2, ±12, 0.25)
+  9. Face Restore      (GFPGAN blend=0.2, auto-skip if coverage>2%)
+  10. Strength Blend   (slider [0, 1])
 
 Usage:
     python main.py --input portrait.jpg --output result.jpg --strength 0.8
@@ -32,6 +33,8 @@ from pipelines.mask_expand import expand_mask
 from pipelines.inpaint import inpaint
 from pipelines.skin_retouch import smooth_skin
 from pipelines.texture_restore import restore_texture
+from pipelines.skin_tone_harmonizer import harmonize_skin_tone
+from pipelines.face_restore import restore_face
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 DEBUG_DIR = OUTPUT_DIR / "debug"
@@ -43,6 +46,9 @@ def run_pipeline(
     img_rgb: np.ndarray,
     strength: float = 0.8,
     save_debug: bool = True,
+    inpaint_backend: str = "lama",
+    face_restore_method: str = "auto",
+    codeformer_fidelity: float = 0.7,
 ) -> dict:
     """
     Run the full 9-step retouch pipeline.
@@ -67,7 +73,8 @@ def run_pipeline(
     steps = {}
 
     print("=" * 60)
-    print(f"  AI Face Retouch Pipeline — {w}×{h}, strength={strength:.2f}")
+    print(f"  AI Face Retouch Pipeline (Evoto-style) - {w}x{h}, strength={strength:.2f}")
+    print(f"  GFPGAN: auto (blend=0.20, skip if coverage>2%)")
     print("=" * 60)
 
     # Save input
@@ -82,7 +89,7 @@ def run_pipeline(
     steps["faces"] = faces
     report.append(f"[Step 1] {face_info}")
     if not faces:
-        print("WARNING: No face detected — pipeline will process full image.")
+        print("WARNING: No face detected - pipeline will process full image.")
 
     # Crop to face region (with padding) for processing
     if faces:
@@ -125,7 +132,10 @@ def run_pipeline(
 
     # ── Step 6: AI Inpainting ──────────────────────────────────────────
     inpainted_roi, inp_method, inp_info = inpaint(
-        face_roi, blemish_mask_roi, soft_mask_roi
+        face_roi,
+        blemish_mask_roi,
+        soft_mask_roi,
+        backend=inpaint_backend,
     )
     steps["inpaint_method"] = inp_method
     report.append(f"[Step 6] {inp_info}")
@@ -138,8 +148,22 @@ def run_pipeline(
     restored_roi, tex_info = restore_texture(smoothed_roi, skin_roi)
     report.append(f"[Step 8] {tex_info}")
 
-    # ── Step 9: Strength Blend ─────────────────────────────────────────
-    print(f"[Step 9] Strength Blend — {strength:.2f}")
+    # ── Step 8.5: Skin Tone Harmonization ──────────────────────────────
+    restored_roi, tone_info = harmonize_skin_tone(restored_roi, skin_mask=skin_roi, strength=0.30)
+    report.append(f"[Step 8.5] {tone_info}")
+
+    # ── Step 9: Face Restoration (GFPGAN) ──────────────────────────
+    restored_roi, gfpgan_info = restore_face(
+        restored_roi,
+        blend=0.20,
+        blemish_mask=blemish_mask_roi,
+        method=face_restore_method,
+        codeformer_fidelity=codeformer_fidelity,
+    )
+    report.append(f"[Step 9] {gfpgan_info}")
+
+    # ── Step 10: Strength Blend ────────────────────────────────────
+    print(f"[Step 10] Strength Blend - {strength:.2f}")
     blended_roi = (
         face_roi.astype(np.float32) * (1 - strength)
         + restored_roi.astype(np.float32) * strength
@@ -152,7 +176,7 @@ def run_pipeline(
     # Save final result
     if save_debug:
         cv2.imwrite(
-            str(DEBUG_DIR / "step9_blended_roi.jpg"),
+            str(DEBUG_DIR / "step10_blended_roi.jpg"),
             cv2.cvtColor(blended_roi, cv2.COLOR_RGB2BGR),
         )
 
@@ -161,15 +185,32 @@ def run_pipeline(
     # Final diff stats
     diff = np.abs(result.astype(float) - img_rgb.astype(float))
     pix_changed = np.any(diff > 10, axis=2).sum()
+
+    # Debug stats (Task 9)
+    blemish_pixels = int(np.count_nonzero(blemish_mask_roi))
+    roi_h, roi_w = face_roi.shape[:2]
+    skin_pixels = int(np.count_nonzero(skin_roi))
+    mask_ratio = blemish_pixels / max(skin_pixels, 1) * 100
+    inpaint_pixels = int(np.count_nonzero(soft_mask_roi > 0))
+
+    print(f"\n  [DEBUG STATS]")
+    print(f"  blemish_pixels:  {blemish_pixels}")
+    print(f"  mask_ratio:      {mask_ratio:.2f}% of skin")
+    print(f"  inpaint_pixels:  {inpaint_pixels}")
+
     final_info = (
         f"\n{'='*60}\n"
         f"  FINAL RESULTS\n"
         f"  Mean diff:       {diff.mean():.2f}/255\n"
         f"  Max diff:        {diff.max():.0f}\n"
-        f"  Pixels Δ>10:     {pix_changed} ({pix_changed/(h*w)*100:.1f}%)\n"
+        f"  Pixels diff>10:  {pix_changed} ({pix_changed/(h*w)*100:.1f}%)\n"
         f"  Strength:        {strength:.2f}\n"
         f"  Blemish method:  {blemish_method}\n"
         f"  Inpaint method:  {inp_method}\n"
+        f"  Blemish pixels:  {blemish_pixels}\n"
+        f"  Mask ratio:      {mask_ratio:.2f}% of skin\n"
+        f"  Inpaint pixels:  {inpaint_pixels}\n"
+        f"  GFPGAN:          auto (blend=0.20)\n"
         f"  Elapsed:         {elapsed:.1f}s\n"
         f"{'='*60}"
     )
@@ -191,6 +232,24 @@ def main():
     parser.add_argument(
         "--strength", "-s", type=float, default=0.8, help="Retouch strength [0-1]"
     )
+    parser.add_argument(
+        "--inpaint-backend",
+        default="lama",
+        choices=["lama", "opencv", "mat", "zits", "sd"],
+        help="Inpainting backend (mat/zits/sd currently map to LaMa).",
+    )
+    parser.add_argument(
+        "--face-restore",
+        default="auto",
+        choices=["auto", "gfpgan", "codeformer"],
+        help="Face restoration backend.",
+    )
+    parser.add_argument(
+        "--codeformer-fidelity",
+        type=float,
+        default=0.7,
+        help="CodeFormer fidelity in [0,1] (higher keeps more original details).",
+    )
     args = parser.parse_args()
 
     inp_path = Path(args.input)
@@ -205,7 +264,13 @@ def main():
 
     print(f"Input: {inp_path}  ({img_rgb.shape[1]}×{img_rgb.shape[0]})")
 
-    out = run_pipeline(img_rgb, strength=args.strength)
+    out = run_pipeline(
+        img_rgb,
+        strength=args.strength,
+        inpaint_backend=args.inpaint_backend,
+        face_restore_method=args.face_restore,
+        codeformer_fidelity=args.codeformer_fidelity,
+    )
 
     # Save output
     out_path = args.output or str(OUTPUT_DIR / f"{inp_path.stem}_retouched.jpg")

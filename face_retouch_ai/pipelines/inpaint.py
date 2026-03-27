@@ -33,7 +33,7 @@ def _lama_inpaint(img_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray | None:
         return None
 
 
-def _opencv_inpaint(img_rgb: np.ndarray, mask: np.ndarray, radius: int = 7) -> np.ndarray:
+def _opencv_inpaint(img_rgb: np.ndarray, mask: np.ndarray, radius: int = 4) -> np.ndarray:
     """OpenCV Telea inpainting fallback."""
     bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     result = cv2.inpaint(bgr, mask, radius, cv2.INPAINT_TELEA)
@@ -44,9 +44,14 @@ def inpaint(
     img_rgb: np.ndarray,
     blemish_mask: np.ndarray,
     soft_mask: np.ndarray,
+    backend: str = "lama",
 ):
     """
-    Inpaint blemish regions, then alpha-blend with soft mask.
+    Inpaint blemish regions with pre-dilated mask for stronger removal,
+    then alpha-blend with soft mask.
+
+    Pre-dilation ensures LaMa sees a larger region around each blemish,
+    producing cleaner fills that cover surrounding redness/scarring.
 
     Returns
     -------
@@ -54,23 +59,77 @@ def inpaint(
     method : str — "lama" or "opencv"
     info   : str
     """
-    print("[Step 6] AI Inpainting")
+    backend = (backend or "lama").strip().lower()
+    aliases = {
+        "mat": "lama",
+        "zits": "lama",
+        "sd": "lama",
+        "sd_inpaint": "lama",
+        "stable-diffusion": "lama",
+        "telea": "opencv",
+    }
+    backend = aliases.get(backend, backend)
+    if backend not in {"lama", "opencv"}:
+        backend = "lama"
 
-    # Binary mask for inpainting engine (need hard edges)
+    print(f"[Step 6] AI Inpainting (pre-dilated) — backend={backend}")
+
+    # Binary mask for inpainting engine
     hard_mask = (blemish_mask > 0).astype(np.uint8) * 255
 
-    # Try LaMa first
-    inpainted = _lama_inpaint(img_rgb, hard_mask)
-    if inpainted is not None:
-        method = "lama"
-        print("  Using LaMa inpainting.")
+    h, w = hard_mask.shape[:2]
+    hard_pixels = int(np.count_nonzero(hard_mask))
+    hard_ratio = hard_pixels / max(1, (h * w))
+
+    # Adaptive parameters (key for "Evoto-like" naturalness)
+    # Small coverage: keep dilation small to avoid creating plasticky patches.
+    # Larger coverage: allow more context so redness/scar area is fully covered.
+    if hard_ratio < 0.001:  # tiny spots
+        dilate_iters = 1
+        dilate_ksize = 5
+        alpha_gain = 0.75
+        telea_radius = 3
+    elif hard_ratio < 0.01:
+        dilate_iters = 2
+        dilate_ksize = 7
+        alpha_gain = 0.90
+        telea_radius = 4
     else:
-        inpainted = _opencv_inpaint(img_rgb, hard_mask)
+        dilate_iters = 2
+        dilate_ksize = 9
+        alpha_gain = 1.00
+        telea_radius = 5
+
+    # Pre-dilate mask before sending to LaMa — key improvement
+    # This gives the inpainter a larger region to work with,
+    # ensuring it covers the full blemish + surrounding redness
+    dilate_kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_ksize, dilate_ksize))
+    inpaint_mask = cv2.dilate(hard_mask, dilate_kern, iterations=int(dilate_iters))
+
+    # Small feather for smoother edges
+    inpaint_mask = cv2.GaussianBlur(inpaint_mask, (5, 5), 1.5)
+    inpaint_mask = (inpaint_mask > 32).astype(np.uint8) * 255
+
+    # Debug: save the actual mask sent to inpainter
+    cv2.imwrite(str(DEBUG_DIR / "step6_inpaint_mask.png"), inpaint_mask)
+
+    # Run selected backend; auto-fallback to OpenCV if chosen backend fails.
+    inpainted = None
+    if backend == "lama":
+        inpainted = _lama_inpaint(img_rgb, inpaint_mask)
+        if inpainted is not None:
+            method = "lama"
+            print("  Using LaMa inpainting (with pre-dilated mask).")
+        else:
+            print("  LaMa unavailable, fallback to OpenCV Telea.")
+    if inpainted is None:
+        inpainted = _opencv_inpaint(img_rgb, inpaint_mask, radius=int(telea_radius))
         method = "opencv"
-        print("  Using OpenCV Telea fallback.")
+        print("  Using OpenCV Telea.")
 
     # Alpha-blend using soft mask (smooth transition at edges)
-    alpha = soft_mask[:, :, np.newaxis]  # (H, W, 1)
+    # soft_mask is typically [0,1]. We modulate slightly to avoid over-smoothing on tiny spots.
+    alpha = (soft_mask * float(alpha_gain)).clip(0.0, 1.0)[:, :, np.newaxis]  # (H, W, 1)
     result = (
         img_rgb.astype(np.float32) * (1 - alpha)
         + inpainted.astype(np.float32) * alpha
@@ -89,6 +148,8 @@ def inpaint(
     diff = np.abs(result.astype(float) - img_rgb.astype(float))
     info = (
         f"Method: {method}\n"
+        f"Hard mask: {hard_pixels} px ({hard_ratio*100:.3f}%)\n"
+        f"Adaptive: dilate={dilate_ksize}×{dilate_ksize} iters={dilate_iters}, alpha_gain={alpha_gain:.2f}, telea_r={telea_radius}\n"
         f"Mean diff: {diff.mean():.2f}/255\n"
         f"Max diff: {diff.max():.0f}\n"
     )
