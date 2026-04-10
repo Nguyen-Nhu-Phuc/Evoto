@@ -13,7 +13,9 @@ Pipeline:
   8. Guided-filter smooth (texture weight slider)
   9. Tone unify         (optional checkbox — Evoto-like even chroma)
   10. Texture restore   (clamped high-pass)
-  11. GFPGAN            (low–moderate blend)
+  10b. GFPGAN / CodeFormer (optional, low–moderate blend)
+  11. (Optional) ModelScope iic/cv_unet_skin-retouching — bước cuối (pha vùng da)
+  UI riêng: nút «Chạy ModelScope» = chỉ model đó (như modelscope.cn)
 """
 
 import sys
@@ -169,6 +171,9 @@ DEFAULT_CONFIG = {
     "highlight_rolloff": 0.045,
     "use_learned_tone_harmonizer": True,
     "learned_tone_strength": 0.32,
+    # ModelScope Alibaba U-Net skin (requires tensorflow + modelscope; see pipelines/modelscope_skin.py)
+    "use_modelscope_skin": False,
+    "modelscope_skin_blend": 0.85,
 }
 
 PROFILE_PRESETS = {
@@ -1045,7 +1050,7 @@ def step_inpainting(img_rgb: np.ndarray, blemish_mask: np.ndarray = None,
             lama_rgb = _lama_inpaint(img_rgb, inp_mask)
         if lama_rgb is not None:
             result = cv2.cvtColor(lama_rgb, cv2.COLOR_RGB2BGR)
-            inpaint_method = "lama"
+            inpaint_method = backend
         else:
             result = _telea_inpaint(img_bgr, inp_mask, inpaint_radius)
             inpaint_method = "telea"
@@ -1495,7 +1500,7 @@ def step_face_restore(img_rgb: np.ndarray, blend: float = None, method: str = No
         method = (method or DEFAULT_CONFIG.get("face_restore_method", "auto")).lower()
         codeformer_fidelity = float(DEFAULT_CONFIG.get("codeformer_fidelity", 0.7))
         print(
-            f"[Step 10] Face Restoration — method={method}, "
+            f"[Step 10b] Face Restoration — method={method}, "
             f"blend={blend:.2f}, fidelity={codeformer_fidelity:.2f}"
         )
 
@@ -1510,12 +1515,12 @@ def step_face_restore(img_rgb: np.ndarray, blend: float = None, method: str = No
         _save_debug("face_restored.jpg", restored_bgr)
 
         comparison = np.hstack([img_bgr, restored_bgr])
-        print(f"[Step 10] Done — {method}")
+        print(f"[Step 10b] Done — {method}")
         return (restored_rgb,
                 cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB), info)
 
     except Exception as exc:
-        print(f"[Step 10] ERROR: {exc}")
+        print(f"[Step 10b] ERROR: {exc}")
         import traceback; traceback.print_exc()
         return img_rgb, img_rgb, f"Face restoration error: {exc}"
 
@@ -1532,8 +1537,10 @@ def run_full_pipeline(img_rgb: np.ndarray,
                       tone_unify_enabled: bool = True,
                       inpaint_backend: str = "lama",
                       face_restore_method: str = "auto",
-                      codeformer_fidelity: float = 0.7):
-    """Run all 10 steps sequentially, save final result and comparison."""
+                      codeformer_fidelity: float = 0.7,
+                      use_modelscope_skin: bool = False,
+                      modelscope_skin_blend: float = None):
+    """Run pipeline steps 1–10, then 10b (GFPGAN), then optional step 11 (ModelScope skin)."""
     if img_rgb is None:
         return [None] * 10 + ["Please upload an image first."]
 
@@ -1551,10 +1558,23 @@ def run_full_pipeline(img_rgb: np.ndarray,
     DEFAULT_CONFIG["inpaint_backend"] = inpaint_backend
     DEFAULT_CONFIG["face_restore_method"] = face_restore_method
     DEFAULT_CONFIG["codeformer_fidelity"] = float(np.clip(codeformer_fidelity, 0.0, 1.0))
+    if modelscope_skin_blend is None:
+        modelscope_skin_blend = DEFAULT_CONFIG["modelscope_skin_blend"]
+    modelscope_skin_blend = float(np.clip(modelscope_skin_blend, 0.0, 1.0))
 
     log = []
     model_source = _resolve_blemish_model_source()
     log.append(f"[Model] Blemish AI source: {model_source}")
+    try:
+        from pipelines.modelscope_skin import modelscope_skin_available
+
+        _ms_ok, _ms_msg = modelscope_skin_available()
+        log.append(
+            f"[Model] ModelScope skin (iic/cv_unet_skin-retouching): "
+            f"{'OK' if _ms_ok else 'N/A'} — {_ms_msg}"
+        )
+    except Exception as _e:
+        log.append(f"[Model] ModelScope skin status: {_e}")
     print("=" * 60)
     print("FULL PIPELINE — START")
     print("=" * 60)
@@ -1587,7 +1607,7 @@ def run_full_pipeline(img_rgb: np.ndarray,
     inpainted, _, inp_info = step_inpainting(img_rgb, blemish_mask, skin_mask)
     log.append(f"[Step 6] {inp_info}")
 
-    # 7. Redness correction
+    # 7. Redness correction (sau inpaint)
     red_corrected, _, red_info = step_redness_correction(inpainted, skin_mask, blemish_mask)
     log.append(f"[Step 7] {red_info}")
 
@@ -1631,7 +1651,7 @@ def run_full_pipeline(img_rgb: np.ndarray,
     restored, _, tex_info = step_texture_restore(unified, used_sharpen, blemish_mask)
     log.append(f"[Step 10] {tex_info}")
 
-    # 11. Face Restoration (GFPGAN — adaptive cap by acne coverage)
+    # 10b. Face Restoration (GFPGAN — trước ModelScope bước 11)
     if restore_blend > 0:
         if blemish_pct >= 4.0:
             blend_cap = 0.35
@@ -1642,18 +1662,37 @@ def run_full_pipeline(img_rgb: np.ndarray,
         used_blend = min(restore_blend, blend_cap)
         if used_blend < restore_blend:
             log.append(
-                f"[Step 11] GFPGAN blend clipped from {restore_blend:.2f} to {used_blend:.2f} (mask={blemish_pct:.2f}%)"
+                f"[Step 10b] GFPGAN blend clipped from {restore_blend:.2f} to {used_blend:.2f} (mask={blemish_pct:.2f}%)"
             )
-        face_restored, _, fr_info = step_face_restore(
+        after_gfpgan, _, fr_info = step_face_restore(
             restored,
             used_blend,
             method=face_restore_method,
         )
-        log.append(f"[Step 11] {fr_info}")
+        log.append(f"[Step 10b] {fr_info}")
     else:
-        face_restored = restored
-        log.append("[Step 11] GFPGAN skipped (blend=0)")
-        print("[Step 11] GFPGAN skipped (blend=0, damages skin texture)")
+        after_gfpgan = restored
+        log.append("[Step 10b] GFPGAN skipped (blend=0)")
+        print("[Step 10b] GFPGAN skipped (blend=0, damages skin texture)")
+
+    # 11. ModelScope skin retouch — bước cuối (pha vùng da)
+    face_restored = after_gfpgan
+    if use_modelscope_skin:
+        try:
+            from pipelines.modelscope_skin import apply_modelscope_skin_retouch
+
+            face_restored, ms_info = apply_modelscope_skin_retouch(
+                after_gfpgan,
+                skin_mask=skin_mask,
+                blend=modelscope_skin_blend,
+            )
+            log.append(f"[Step 11] {ms_info}")
+        except Exception as ms_exc:
+            print(f"[Step 11] ModelScope skin retouch failed: {ms_exc}")
+            log.append(f"[Step 11] ModelScope skin retouch failed: {ms_exc}")
+            face_restored = after_gfpgan
+    else:
+        log.append("[Step 11] ModelScope skin retouch off (checkbox)")
 
     # Save final result
     final = face_restored
@@ -1878,6 +1917,28 @@ def get_evoto_theme():
     )
 
 
+def collect_models_health() -> str:
+    """Chuỗi ngắn cho UI: model mụn, MediaPipe, BiSeNet, ModelScope skin, GFPGAN."""
+    lines: list[str] = []
+    lines.append(f"Mụn / blemish: {_resolve_blemish_model_source()}")
+    lm = _resolve_face_landmarker_path()
+    lines.append(
+        f"MediaPipe Face Landmarker: {'OK — ' + lm.name if lm else 'Thiếu — ' + _LM_DL_HINT}"
+    )
+    bisenet = MODELS_DIR / "face_parsing" / "79999_iter.pth"
+    lines.append(f"BiSeNet face parsing: {'OK' if bisenet.is_file() else 'Thiếu weights (79999_iter.pth)'}")
+    try:
+        from pipelines.modelscope_skin import modelscope_skin_available
+
+        ok, msg = modelscope_skin_available()
+        lines.append(f"ModelScope skin (bước 11): {'Sẵn sàng' if ok else 'Chưa sẵn sàng'} — {msg}")
+    except Exception as exc:
+        lines.append(f"ModelScope skin: lỗi kiểm tra — {exc}")
+    gfpgan_p = MODELS_DIR / "face_restore" / "GFPGANv1.4.pth"
+    lines.append(f"GFPGAN v1.4: {'OK' if gfpgan_p.is_file() else 'Chưa có file (sẽ tải khi chạy lần đầu)'}")
+    return "\n".join(lines)
+
+
 def run_full_pipeline_for_ui(
     img_rgb: np.ndarray,
     smooth_strength: int,
@@ -1889,6 +1950,8 @@ def run_full_pipeline_for_ui(
     inpaint_backend: str,
     face_restore_method: str,
     codeformer_fidelity: float,
+    use_modelscope_skin: bool,
+    modelscope_skin_blend: float,
 ):
     """Chạy pipeline + cặp ảnh cho ImageSlider + đường dẫn file Xuất + state cho realtime."""
     empty_slider = (None, None)
@@ -1925,6 +1988,8 @@ def run_full_pipeline_for_ui(
         inpaint_backend,
         face_restore_method,
         codeformer_fidelity,
+        use_modelscope_skin=use_modelscope_skin,
+        modelscope_skin_blend=modelscope_skin_blend,
     )
     final_path = OUTPUTS_DIR / "final_result.jpg"
     dl = str(final_path.resolve()) if final_path.is_file() else None
@@ -1945,6 +2010,39 @@ def run_full_pipeline_for_ui(
         dl,
         state,
     )
+
+
+def step_modelscope_skin_only(img_rgb: np.ndarray):
+    """
+    Giống demo ModelScope: ảnh vào → iic/cv_unet_skin-retouching → ảnh ra.
+    Không inpaint, không GFPGAN, không pha BiSeNet — toàn khung như pipeline gốc.
+    Trả về thêm đường dẫn file JPG để nút Xuất tải về.
+    """
+    try:
+        if img_rgb is None or img_rgb.size == 0:
+            return None, None, "Chưa có ảnh hoặc ảnh rỗng.", None
+        from pipelines.modelscope_skin import apply_modelscope_skin_retouch
+
+        out, info = apply_modelscope_skin_retouch(
+            img_rgb,
+            skin_mask=None,
+            blend=1.0,
+        )
+        comp = np.hstack([img_rgb, out])
+        dl = None
+        if out is not None and out.size > 0:
+            out_path = OUTPUTS_DIR / "modelscope_only.jpg"
+            bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+            if cv2.imwrite(str(out_path), bgr):
+                dl = str(out_path.resolve())
+                info = (info or "") + f"\nĐã lưu xuất: {out_path.name}"
+        return out, comp, info, dl
+    except Exception as exc:
+        print(f"[ModelScope-only] ERROR: {exc}")
+        import traceback
+
+        traceback.print_exc()
+        return None, None, f"Lỗi ModelScope skin-only: {exc}", None
 
 
 def apply_display_realtime(
@@ -1970,114 +2068,316 @@ def apply_display_realtime(
 
 
 def build_ui():
-    with gr.Blocks(title="Retouch AI") as demo:
+    with gr.Blocks(title="Retouch AI · ModelScope + Pipeline đầy đủ") as demo:
         with gr.Row(elem_classes="evoto-topbar"):
             gr.HTML(
                 '<div class="evoto-brand-wrap"><span class="evoto-brand-mark"></span>'
                 '<div><p class="evoto-brand-title">Retouch AI</p>'
-                '<p class="evoto-brand-sub">Trước / sau · Xuất ảnh · Phong cách Evoto</p></div></div>'
+                '<p class="evoto-brand-sub">ModelScope skin + pipeline đầy đủ · Trước / sau · Xuất</p></div></div>'
             )
-            with gr.Row(elem_classes="evoto-top-actions"):
-                gr.Button("Hoàn tác", size="sm", interactive=False)
-                gr.Button("Làm lại", size="sm", interactive=False)
-                btn_export = gr.DownloadButton(
-                    "Xuất",
-                    value=None,
-                    elem_classes="evoto-export-wrap",
-                )
 
         with gr.Row(equal_height=True):
             with gr.Column(scale=5, min_width=300, elem_classes="evoto-side-panel"):
-                input_img = gr.Image(label="Ảnh gốc", type="numpy", height=300)
-                dd_profile = gr.Dropdown(
-                    choices=list(PROFILE_PRESETS.keys()),
-                    value="Evoto Target",
-                    label="Chất lượng mục tiêu",
+                input_img = gr.Image(label="Ảnh gốc", type="numpy", height=320)
+                gr.Markdown(
+                    "ModelScope **một bước** ([modelscope.cn](https://www.modelscope.cn/models/iic/cv_unet_skin-retouching)). "
+                    "**Bên dưới** là pipeline retouch đầy đủ (mụn, inpaint, GFPGAN, v.v.)."
                 )
+                with gr.Accordion("Trạng thái model (kiểm tra nhanh)", open=False):
+                    btn_models_health = gr.Button("Kiểm tra model", size="sm")
+                    out_models_health = gr.Textbox(
+                        label="Kết quả",
+                        lines=7,
+                        max_lines=12,
+                        interactive=False,
+                    )
                 with gr.Row():
-                    btn_profile = gr.Button("Áp preset", variant="secondary", scale=1)
-                    btn_preset = gr.Button("Mụn nặng", variant="secondary", scale=1)
-                cb_tone_unify = gr.Checkbox(
-                    value=True,
-                    label="Đồng nhất tone da (bước 9)",
+                    btn_ms_only = gr.Button(
+                        "Chạy ModelScope",
+                        variant="primary",
+                        size="lg",
+                        elem_classes="evoto-run-primary",
+                        scale=2,
+                    )
+                    btn_export_ms = gr.DownloadButton(
+                        "Xuất ảnh ModelScope",
+                        value=None,
+                        scale=1,
+                        elem_classes="evoto-export-wrap",
+                    )
+                # (removed) Secondary controls
+                out_ms_info = gr.Textbox(label="Thông tin", lines=5)
+            with gr.Column(scale=11, min_width=400, elem_classes="evoto-main-panel"):
+                out_ms_only = gr.Image(label="Kết quả", type="numpy", height=420)
+                out_ms_comp = gr.Image(
+                    label="So sánh: trái gốc · phải sau ModelScope",
+                    type="numpy",
+                    height=420,
                 )
-                with gr.Accordion("Điều chỉnh chi tiết", open=True):
-                    sl_smooth = gr.Slider(
-                        1, 20, DEFAULT_CONFIG["smooth_strength"], step=1, label="Độ làm mịn"
+
+        # (removed) Extra one-step editor
+
+        with gr.Column(visible=True):
+            with gr.Row(elem_classes="evoto-topbar"):
+                with gr.Row(elem_classes="evoto-top-actions"):
+                    gr.Button("Hoàn tác", size="sm", interactive=False)
+                    gr.Button("Làm lại", size="sm", interactive=False)
+                    btn_export = gr.DownloadButton(
+                        "Xuất",
+                        value=None,
+                        elem_classes="evoto-export-wrap",
                     )
-                    sl_texture = gr.Slider(
-                        0.0, 1.0, DEFAULT_CONFIG["texture_strength"], step=0.05, label="Giữ chi tiết da"
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=5, min_width=300, elem_classes="evoto-side-panel"):
+                    gr.Markdown("**Pipeline Retouch AI đầy đủ** — preset, inpaint, GFPGAN, debug từng bước.")
+                    dd_profile = gr.Dropdown(
+                        choices=list(PROFILE_PRESETS.keys()),
+                        value="Evoto Target",
+                        label="Chất lượng mục tiêu",
                     )
-                    sl_sharpen = gr.Slider(
-                        0.0, 0.5, DEFAULT_CONFIG["sharpen_strength"], step=0.05, label="Khôi phục texture"
+                    with gr.Row():
+                        btn_profile = gr.Button("Áp preset", variant="secondary", scale=1)
+                        btn_preset = gr.Button("Mụn nặng", variant="secondary", scale=1)
+                    cb_tone_unify = gr.Checkbox(
+                        value=True,
+                        label="Đồng nhất tone da (bước 9)",
                     )
-                    sl_blemish = gr.Slider(
-                        0.1, 0.9, DEFAULT_CONFIG["blemish_ai_threshold"], step=0.05, label="Ngưỡng AI (mụn)"
+                    cb_modelscope_skin = gr.Checkbox(
+                        value=DEFAULT_CONFIG["use_modelscope_skin"],
+                        label="ModelScope iic/cv_unet_skin-retouching (bước 11 — sau GFPGAN, bước cuối)",
                     )
-                    sl_restore_blend = gr.Slider(
-                        0.0, 1.0, DEFAULT_CONFIG["face_restore_blend"], step=0.1, label="GFPGAN (0–1)"
-                    )
-                    dd_inpaint_backend = gr.Dropdown(
-                        choices=["lama", "telea", "mat", "zits", "sd"],
-                        value=DEFAULT_CONFIG["inpaint_backend"],
-                        label="Inpaint backend",
-                    )
-                    dd_face_restore = gr.Dropdown(
-                        choices=["auto", "gfpgan", "codeformer"],
-                        value=DEFAULT_CONFIG["face_restore_method"],
-                        label="Face restore backend",
-                    )
-                    sl_codeformer_fidelity = gr.Slider(
+                    sl_modelscope_skin_blend = gr.Slider(
                         0.0,
                         1.0,
-                        DEFAULT_CONFIG["codeformer_fidelity"],
+                        DEFAULT_CONFIG["modelscope_skin_blend"],
                         step=0.05,
-                        label="CodeFormer fidelity",
+                        label="Pha ModelScope trên vùng da (0 = giữ sau GFPGAN, 1 = hết ModelScope)",
                     )
-                btn_all = gr.Button(
-                    "Áp dụng retouch",
-                    variant="primary",
-                    size="lg",
-                    elem_classes="evoto-run-primary",
-                )
+                    with gr.Accordion("Điều chỉnh chi tiết", open=True):
+                        sl_smooth = gr.Slider(
+                            1, 20, DEFAULT_CONFIG["smooth_strength"], step=1, label="Độ làm mịn"
+                        )
+                        sl_texture = gr.Slider(
+                            0.0, 1.0, DEFAULT_CONFIG["texture_strength"], step=0.05, label="Giữ chi tiết da"
+                        )
+                        sl_sharpen = gr.Slider(
+                            0.0, 0.5, DEFAULT_CONFIG["sharpen_strength"], step=0.05, label="Khôi phục texture"
+                        )
+                        sl_blemish = gr.Slider(
+                            0.1, 0.9, DEFAULT_CONFIG["blemish_ai_threshold"], step=0.05, label="Ngưỡng AI (mụn)"
+                        )
+                        sl_restore_blend = gr.Slider(
+                            0.0, 1.0, DEFAULT_CONFIG["face_restore_blend"], step=0.1, label="GFPGAN (0–1)"
+                        )
+                        dd_inpaint_backend = gr.Dropdown(
+                            choices=["lama", "telea", "mat", "zits", "sd"],
+                            value=DEFAULT_CONFIG["inpaint_backend"],
+                            label="Inpaint backend",
+                        )
+                        dd_face_restore = gr.Dropdown(
+                            choices=["auto", "gfpgan", "codeformer"],
+                            value=DEFAULT_CONFIG["face_restore_method"],
+                            label="Face restore backend",
+                        )
+                        sl_codeformer_fidelity = gr.Slider(
+                            0.0,
+                            1.0,
+                            DEFAULT_CONFIG["codeformer_fidelity"],
+                            step=0.05,
+                            label="CodeFormer fidelity",
+                        )
+                    btn_all = gr.Button(
+                        "Áp dụng retouch",
+                        variant="primary",
+                        size="lg",
+                        elem_classes="evoto-run-primary",
+                    )
 
-            with gr.Column(scale=11, elem_classes="evoto-main-panel"):
-                blend_state = gr.State(None)
-                with gr.Row():
-                    sl_strength = gr.Slider(0, 100, 100, step=1, label="Cường độ retouch")
-                    sl_brightness = gr.Slider(-30, 30, 0, step=1, label="Độ sáng")
-                    sl_contrast = gr.Slider(0.7, 1.5, 1.0, step=0.05, label="Độ tương phản")
-                before_after = gr.ImageSlider(
-                    label="Trước · Sau",
-                    type="numpy",
-                    slider_position=50,
-                    max_height=600,
-                )
-                out_log = gr.Textbox(label="Nhật ký xử lý", lines=6, max_lines=16)
+                with gr.Column(scale=11, elem_classes="evoto-main-panel"):
+                    blend_state = gr.State(None)
+                    with gr.Row():
+                        sl_strength = gr.Slider(0, 100, 100, step=1, label="Cường độ retouch")
+                        sl_brightness = gr.Slider(-30, 30, 0, step=1, label="Độ sáng")
+                        sl_contrast = gr.Slider(0.7, 1.5, 1.0, step=0.05, label="Độ tương phản")
+                    before_after = gr.ImageSlider(
+                        label="Trước · Sau",
+                        type="numpy",
+                        slider_position=50,
+                        max_height=600,
+                    )
+                    out_log = gr.Textbox(label="Nhật ký xử lý", lines=6, max_lines=16)
 
-        with gr.Accordion("Xem từng bước (debug)", open=False):
-            with gr.Row():
-                out_det = gr.Image(label="1. Phát hiện mặt")
-                out_lm = gr.Image(label="2. Landmark")
-                out_parse = gr.Image(label="3. Parse")
-                out_blem = gr.Image(label="4. Mặt nạ mụn")
-            with gr.Row():
-                out_inp = gr.Image(label="6. Inpaint")
-                out_red = gr.Image(label="7. Hết đỏ")
-                out_ret = gr.Image(label="8. Làm mịn")
-                out_tex = gr.Image(label="9. Texture")
-            with gr.Row():
-                out_face_rest = gr.Image(label="10. GFPGAN")
-                out_comp = gr.Image(label="Cạnh nhau")
-
-        with gr.Row(elem_classes="evoto-bottombar"):
-            gr.Button("Đồng bộ", size="sm", interactive=False)
-            gr.Radio(
-                ["Nữ", "Nam"],
-                value="Nữ",
-                label="Preset giới tính (giao diện)",
+            gr.Markdown(
+                "### Các bước pipeline và model / backend\n\n"
+                "| Bước | Model hoặc backend |\n"
+                "|------|--------------------|\n"
+                "| 1 · Phát hiện mặt | **InsightFace** RetinaFace (`buffalo_l`) hoặc **MediaPipe** BlazeFace |\n"
+                "| 2 · Landmark | **MediaPipe** Face Landmarker (`.task`) |\n"
+                "| 3 · Parse da | **BiSeNet** (79999_iter) |\n"
+                "| 4 · Mụn | **SegFormer / U-Net** blemish (nếu có checkpoint) + heuristic LAB/Laplacian |\n"
+                "| 5 · Inpaint | **LaMa** (simple-lama-inpainting) / **OpenCV** Telea |\n"
+                "| 7–9 · Màu / mịn / texture | Xử lý cổ điển (LAB, guided filter, high-pass) |\n"
+                "| 10 · Texture | High-pass có giới hạn |\n"
+                "| 10b · (tùy chọn) | **GFPGAN** / **CodeFormer** |\n"
+                "| 11 · (tùy chọn) | **ModelScope** `iic/cv_unet_skin-retouching` — sau GFPGAN, bước cuối |\n\n"
+                "Dưới đây: **ảnh từng bước** sau khi chạy «Áp dụng retouch», và **tab chạy riêng** từng bước."
             )
+            with gr.Accordion("Xem từng bước (debug) — ảnh output", open=True):
+                with gr.Row():
+                    out_det = gr.Image(label="1 · Mặt (RetinaFace / MediaPipe)")
+                    out_lm = gr.Image(label="2 · Landmark (MediaPipe)")
+                    out_parse = gr.Image(label="3 · Parse (BiSeNet)")
+                    out_blem = gr.Image(label="4 · Mụn (SegFormer·U-Net + heuristic)")
+                with gr.Row():
+                    out_inp = gr.Image(label="5 · Inpaint (LaMa / Telea)")
+                    out_red = gr.Image(label="7 · Hết đỏ (LAB)")
+                    out_ret = gr.Image(label="8 · Mịn (guided filter)")
+                    out_tex = gr.Image(label="9 · Texture (high-pass)")
+                with gr.Row():
+                    out_face_rest = gr.Image(label="10b · GFPGAN → 11 · ModelScope (kết quả cuối)")
+                    out_comp = gr.Image(label="So sánh cuối")
 
+            with gr.Row(elem_classes="evoto-bottombar"):
+                gr.Button("Đồng bộ", size="sm", interactive=False)
+                gr.Radio(
+                    ["Nữ", "Nam"],
+                    value="Nữ",
+                    label="Preset giới tính (giao diện)",
+                )
+
+            with gr.Accordion("Công cụ từng bước — chạy riêng từng model", open=True):
+                gr.Markdown(
+                    "Mỗi tab gọi **một bước** trên ảnh **Ảnh gốc** (cột trái trên), không chạy cả pipeline. "
+                    "Xem bảng model ở trên."
+                )
+                with gr.Tabs():
+                    with gr.Tab("1 · Mặt (RetinaFace/MediaPipe)"):
+                        btn1 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o1_img = gr.Image(label="Kết quả")
+                            o1_info = gr.Textbox(label="Thông tin", lines=4)
+                        btn1.click(step_face_detection, [input_img], [o1_img, o1_info])
+
+                    with gr.Tab("2 · Landmark (MediaPipe)"):
+                        btn2 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o2_img = gr.Image(label="Kết quả")
+                            o2_info = gr.Textbox(label="Thông tin", lines=2)
+                        btn2.click(step_landmarks, [input_img], [o2_img, o2_info])
+
+                    with gr.Tab("3 · Parse (BiSeNet)"):
+                        btn3 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o3_mask = gr.Image(label="Mặt nạ phân vùng")
+                            o3_skin = gr.Image(label="Da")
+                        o3_info = gr.Textbox(label="Thông tin", lines=6)
+                        btn3.click(step_face_parsing, [input_img], [o3_mask, o3_skin, o3_info])
+
+                    with gr.Tab("4 · Mụn (AI + heuristic)"):
+                        s4_thresh = gr.Slider(
+                            0.1, 0.9, DEFAULT_CONFIG["blemish_ai_threshold"],
+                            step=0.05, label="Ngưỡng AI",
+                        )
+                        btn4 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o4_mask = gr.Image(label="Mặt nạ")
+                            o4_overlay = gr.Image(label="Overlay")
+                        o4_info = gr.Textbox(label="Thông tin", lines=3)
+                        btn4.click(
+                            lambda img, t: step_blemish_detection(img, None, t),
+                            [input_img, s4_thresh],
+                            [o4_mask, o4_overlay, o4_info],
+                        )
+
+                    with gr.Tab("5 · Inpaint (LaMa/Telea)"):
+                        btn5 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o5_img = gr.Image(label="Kết quả")
+                            o5_comp = gr.Image(label="So sánh")
+                        o5_info = gr.Textbox(label="Thông tin", lines=2)
+                        btn5.click(
+                            lambda img: step_inpainting(img),
+                            [input_img],
+                            [o5_img, o5_comp, o5_info],
+                        )
+
+                    with gr.Tab("7 · Hết đỏ (LAB)"):
+                        btn_red = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o_red = gr.Image(label="Kết quả")
+                            o_red_comp = gr.Image(label="So sánh")
+                        o_red_info = gr.Textbox(label="Thông tin", lines=2)
+                        btn_red.click(
+                            lambda img: step_redness_correction(img),
+                            [input_img],
+                            [o_red, o_red_comp, o_red_info],
+                        )
+
+                    with gr.Tab("8 · Mịn da (guided)"):
+                        with gr.Row():
+                            s6_smooth = gr.Slider(
+                                1, 20, DEFAULT_CONFIG["smooth_strength"], step=1, label="Độ làm mịn"
+                            )
+                            s6_texture = gr.Slider(
+                                0.0, 1.0, DEFAULT_CONFIG["texture_strength"],
+                                step=0.05, label="Chi tiết da",
+                            )
+                        btn6 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o6_img = gr.Image(label="Kết quả")
+                            o6_comp = gr.Image(label="So sánh")
+                        o6_info = gr.Textbox(label="Thông tin", lines=2)
+                        btn6.click(
+                            lambda img, s, t: step_skin_retouch(img, None, s, t),
+                            [input_img, s6_smooth, s6_texture],
+                            [o6_img, o6_comp, o6_info],
+                        )
+
+                    with gr.Tab("9 · Texture (high-pass)"):
+                        s7_sharp = gr.Slider(
+                            0.0, 0.5, DEFAULT_CONFIG["sharpen_strength"],
+                            step=0.05, label="Sharpen",
+                        )
+                        btn7 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o7_img = gr.Image(label="Kết quả")
+                            o7_comp = gr.Image(label="So sánh")
+                        o7_info = gr.Textbox(label="Thông tin", lines=2)
+                        btn7.click(
+                            lambda img, s: step_texture_restore(img, s),
+                            [input_img, s7_sharp],
+                            [o7_img, o7_comp, o7_info],
+                        )
+
+                    with gr.Tab("10 · GFPGAN / CodeFormer"):
+                        gr.Markdown("Khôi phục / làm net khuôn mặt (GFPGAN).")
+                        with gr.Row():
+                            s8_blend = gr.Slider(
+                                0.0, 1.0, DEFAULT_CONFIG["face_restore_blend"],
+                                step=0.1, label="Blend (0=gốc, 1=restored)",
+                            )
+                        btn8 = gr.Button("Chạy", variant="primary")
+                        with gr.Row():
+                            o8_img = gr.Image(label="Kết quả")
+                            o8_comp = gr.Image(label="So sánh")
+                        o8_info = gr.Textbox(label="Thông tin", lines=3)
+                        btn8.click(
+                            lambda img, b: step_face_restore(img, b),
+                            [input_img, s8_blend],
+                            [o8_img, o8_comp, o8_info],
+                        )
+
+        btn_models_health.click(
+            collect_models_health,
+            inputs=[],
+            outputs=[out_models_health],
+        )
+        btn_ms_only.click(
+            step_modelscope_skin_only,
+            inputs=[input_img],
+            outputs=[out_ms_only, out_ms_comp, out_ms_info, btn_export_ms],
+        )
+        # (removed) Extra one-step handlers
         btn_preset.click(
             apply_acne_heavy_preset,
             inputs=[input_img],
@@ -2101,6 +2401,8 @@ def build_ui():
                 dd_inpaint_backend,
                 dd_face_restore,
                 sl_codeformer_fidelity,
+                cb_modelscope_skin,
+                sl_modelscope_skin_blend,
             ],
             outputs=[
                 out_det,
@@ -2118,6 +2420,7 @@ def build_ui():
                 btn_export,
                 blend_state,
             ],
+            show_progress="full",
         )
 
         def _on_display_change(state, strength, brightness, contrast):
@@ -2132,125 +2435,6 @@ def build_ui():
                 show_progress="hidden",
             )
 
-        with gr.Accordion("Công cụ từng bước", open=False):
-            gr.Markdown("Dùng chung ảnh **Ảnh gốc** ở cột trái.")
-            with gr.Tabs():
-                with gr.Tab("1. Phát hiện mặt"):
-                    btn1 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o1_img = gr.Image(label="Kết quả")
-                        o1_info = gr.Textbox(label="Thông tin", lines=4)
-                    btn1.click(step_face_detection, [input_img], [o1_img, o1_info])
-
-                with gr.Tab("2. Landmark"):
-                    btn2 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o2_img = gr.Image(label="Kết quả")
-                        o2_info = gr.Textbox(label="Thông tin", lines=2)
-                    btn2.click(step_landmarks, [input_img], [o2_img, o2_info])
-
-                with gr.Tab("3. Parse vùng mặt"):
-                    btn3 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o3_mask = gr.Image(label="Mặt nạ phân vùng")
-                        o3_skin = gr.Image(label="Da")
-                    o3_info = gr.Textbox(label="Thông tin", lines=6)
-                    btn3.click(step_face_parsing, [input_img], [o3_mask, o3_skin, o3_info])
-
-                with gr.Tab("4. Phát hiện mụn"):
-                    s4_thresh = gr.Slider(
-                        0.1, 0.9, DEFAULT_CONFIG["blemish_ai_threshold"],
-                        step=0.05, label="Ngưỡng AI",
-                    )
-                    btn4 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o4_mask = gr.Image(label="Mặt nạ")
-                        o4_overlay = gr.Image(label="Overlay")
-                    o4_info = gr.Textbox(label="Thông tin", lines=3)
-                    btn4.click(
-                        lambda img, t: step_blemish_detection(img, None, t),
-                        [input_img, s4_thresh],
-                        [o4_mask, o4_overlay, o4_info],
-                    )
-
-                with gr.Tab("5. Inpaint"):
-                    btn5 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o5_img = gr.Image(label="Kết quả")
-                        o5_comp = gr.Image(label="So sánh")
-                    o5_info = gr.Textbox(label="Thông tin", lines=2)
-                    btn5.click(
-                        lambda img: step_inpainting(img),
-                        [input_img],
-                        [o5_img, o5_comp, o5_info],
-                    )
-
-                with gr.Tab("7. Hết đỏ"):
-                    btn_red = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o_red = gr.Image(label="Kết quả")
-                        o_red_comp = gr.Image(label="So sánh")
-                    o_red_info = gr.Textbox(label="Thông tin", lines=2)
-                    btn_red.click(
-                        lambda img: step_redness_correction(img),
-                        [input_img],
-                        [o_red, o_red_comp, o_red_info],
-                    )
-
-                with gr.Tab("8. Làm mịn da"):
-                    with gr.Row():
-                        s6_smooth = gr.Slider(
-                            1, 20, DEFAULT_CONFIG["smooth_strength"], step=1, label="Độ làm mịn"
-                        )
-                        s6_texture = gr.Slider(
-                            0.0, 1.0, DEFAULT_CONFIG["texture_strength"],
-                            step=0.05, label="Chi tiết da",
-                        )
-                    btn6 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o6_img = gr.Image(label="Kết quả")
-                        o6_comp = gr.Image(label="So sánh")
-                    o6_info = gr.Textbox(label="Thông tin", lines=2)
-                    btn6.click(
-                        lambda img, s, t: step_skin_retouch(img, None, s, t),
-                        [input_img, s6_smooth, s6_texture],
-                        [o6_img, o6_comp, o6_info],
-                    )
-
-                with gr.Tab("9. Texture"):
-                    s7_sharp = gr.Slider(
-                        0.0, 0.5, DEFAULT_CONFIG["sharpen_strength"],
-                        step=0.05, label="Sharpen",
-                    )
-                    btn7 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o7_img = gr.Image(label="Kết quả")
-                        o7_comp = gr.Image(label="So sánh")
-                    o7_info = gr.Textbox(label="Thông tin", lines=2)
-                    btn7.click(
-                        lambda img, s: step_texture_restore(img, s),
-                        [input_img, s7_sharp],
-                        [o7_img, o7_comp, o7_info],
-                    )
-
-                with gr.Tab("10. GFPGAN"):
-                    gr.Markdown("Khôi phục / làm net khuôn mặt (GFPGAN).")
-                    with gr.Row():
-                        s8_blend = gr.Slider(
-                            0.0, 1.0, DEFAULT_CONFIG["face_restore_blend"],
-                            step=0.1, label="Blend (0=gốc, 1=restored)",
-                        )
-                    btn8 = gr.Button("Chạy", variant="primary")
-                    with gr.Row():
-                        o8_img = gr.Image(label="Kết quả")
-                        o8_comp = gr.Image(label="So sánh")
-                    o8_info = gr.Textbox(label="Thông tin", lines=3)
-                    btn8.click(
-                        lambda img, b: step_face_restore(img, b),
-                        [input_img, s8_blend],
-                        [o8_img, o8_comp, o8_info],
-                    )
-
     return demo
 
 
@@ -2258,7 +2442,7 @@ if __name__ == "__main__":
     demo = build_ui()
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=int(__import__("os").environ.get("GRADIO_SERVER_PORT", "7860")),
         share=False,
         theme=get_evoto_theme(),
         css=EVOTO_CSS,

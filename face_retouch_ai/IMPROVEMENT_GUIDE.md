@@ -34,8 +34,8 @@ Tài liệu này mô tả chi tiết cách cải thiện từng phần của pip
 
 - Tham khảo: `DATASET_PREP_GUIDE.md`, `KAGGLE_TRAINING_NOTE.md`.
 - Cấu trúc cần có:
-  - `datasets/acne_mega/images/` — ảnh chân dung.
-  - `datasets/acne_mega/masks/` — mask nhị phân (0 = background, 255 = vùng cần xóa).
+  - `project_datasets/acne_mega/images/` — ảnh chân dung.
+  - `project_datasets/acne_mega/masks/` — mask nhị phân (0 = background, 255 = vùng cần xóa).
 - Quy tắc mask:
   - Chỉ đánh dấu mụn, sẹo, vết đỏ — **không** đánh dấu nốt ruồi nếu muốn giữ.
   - Không bao gồm mắt, lông mày, môi, tóc, lỗ mũi.

@@ -10,6 +10,7 @@ gdown
 Pillow>=10.1
 gradio
 transformers
+datasets>=2.14.0
 safetensors
 insightface
 onnxruntime
@@ -17,3 +18,9 @@ requests
 scikit-image
 tqdm
 lpips
+modelscope>=1.9.0
+oss2>=2.18.0
+simplejson>=3.19.0
+# ModelScope skin-retouching (tf_graph.pb). If import fails on ml_dtypes/jax, run: pip uninstall jax jaxlib -y
+tensorflow>=2.15,<2.18
+

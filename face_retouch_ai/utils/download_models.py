@@ -221,6 +221,24 @@ def download_missing(rows: list[dict]) -> None:
     )
 
 
+def download_modelscope_skin_retouching() -> bool:
+    """Download iic/cv_unet_skin-retouching into models/modelscope/ (ModelScope SDK)."""
+    try:
+        from modelscope import snapshot_download
+    except ImportError:
+        print("   [ERROR] modelscope is not installed. Run: pip install modelscope")
+        return False
+    dest = MODELS_DIR / "modelscope" / "iic_cv_unet_skin_retouching"
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        print(f"\n>> ModelScope skin retouch: {dest}")
+        snapshot_download("iic/cv_unet_skin-retouching", local_dir=str(dest))
+        return True
+    except Exception as exc:
+        print(f"   [ERROR] ModelScope skin download: {exc}")
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit/download face_retouch_ai models")
     parser.add_argument(
@@ -228,9 +246,16 @@ def main() -> None:
         action="store_true",
         help="Only audit models without downloading.",
     )
+    parser.add_argument(
+        "--modelscope-skin",
+        action="store_true",
+        help="Download iic/cv_unet_skin-retouching (TensorFlow + PyTorch weights; face detector loads on first pipeline use).",
+    )
     args = parser.parse_args()
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if args.modelscope_skin:
+        download_modelscope_skin_retouching()
     rows = audit_models()
     print_audit(rows)
     if args.check_only:

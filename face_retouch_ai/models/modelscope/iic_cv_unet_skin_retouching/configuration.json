@@ -1,0 +1,7 @@
+{
+    "framework": "pytorch, tensorflow",
+    "task": "skin-retouching",
+    "pipeline": {
+       "type": "unet-skin-retouching"
+    }
+}
